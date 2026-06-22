@@ -1,12 +1,47 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const EMBEDDED_WORKER: &[u8] = include_bytes!(env!("APPLE_TRANSLATE_RS_SYNC_WORKER_BIN"));
 const EMBEDDED_WORKER_ID: &str = env!("APPLE_TRANSLATE_RS_SYNC_WORKER_ID");
 
-/// Number of EMTTranslator engines per worker subprocess.
-/// 4 is the sweet spot on Apple Silicon: 3.0× scaling over single engine.
-/// More engines cause memory contention (each loads the ~88 MB model).
-pub const WORKER_NUM_ENGINES: usize = 4;
+/// Default number of EMTTranslator engines per worker subprocess.
+///
+/// 1 is the sweet spot for minimal memory with no throughput regression:
+/// each engine independently loads the ~88 MB neural model, and additional
+/// engines only help when a single `translate_batch` call contains many
+/// texts that can be distributed across engines. For single-item batches
+/// (e.g. long-form text), only one engine does work regardless of count.
+///
+/// Bump to 2–4 via [`set_worker_num_engines`] for batch-short-text
+/// workloads to get intra-worker parallelism (up to ~3× throughput).
+pub const DEFAULT_WORKER_NUM_ENGINES: usize = 1;
+
+static WORKER_NUM_ENGINES_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the number of EMTTranslator engines per worker subprocess.
+///
+/// Must be called before the first translation for a language pair —
+/// workers are spawned lazily and the value is read at spawn time.
+/// Values outside 1..=32 are clamped.
+///
+/// If never called, checks the `APPLE_TRANSLATE_RS_SYNC_WORKER_NUM_ENGINES`
+/// environment variable. Falls back to [`DEFAULT_WORKER_NUM_ENGINES`] (1).
+pub fn set_worker_num_engines(n: usize) {
+    WORKER_NUM_ENGINES_OVERRIDE.store(n, Ordering::Relaxed);
+}
+
+pub fn worker_num_engines() -> usize {
+    let override_val = WORKER_NUM_ENGINES_OVERRIDE.load(Ordering::Relaxed);
+    if override_val > 0 {
+        return override_val;
+    }
+    if let Ok(env_val) = std::env::var("APPLE_TRANSLATE_RS_SYNC_WORKER_NUM_ENGINES")
+        && let Ok(n) = env_val.parse::<usize>()
+            && n > 0 {
+                return n;
+            }
+    DEFAULT_WORKER_NUM_ENGINES
+}
 
 /// Normalize a BCP-47 language tag to the ICU locale format used by
 /// AssetsV3 directory names (e.g. "zh-Hans" → "zh_CN", "en" → "en_US").

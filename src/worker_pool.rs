@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 
-use crate::config::{self, WORKER_NUM_ENGINES};
+use crate::config;
 
 /// A persistent translation worker subprocess.
 ///
@@ -36,7 +36,7 @@ impl WorkerPool {
             &assets_dir.to_string_lossy(),
             &src_icu,
             &tgt_icu,
-            WORKER_NUM_ENGINES,
+            config::worker_num_engines(),
         )
         .ok()
     }

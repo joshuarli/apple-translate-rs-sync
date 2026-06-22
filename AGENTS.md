@@ -73,6 +73,10 @@ let lang = detect_language("Bonjour le monde");  // Some("fr")
 
 // Availability check
 check_language_availability("zh-Hans", "en")?;
+
+// Tune worker engine count (must be called before first translation).
+// Default is 1 — bump to 2–4 for batch-short-text workloads.
+apple_translate_rs_sync::set_worker_num_engines(4);
 ```
 
 ## Architecture
@@ -130,8 +134,35 @@ Engine scaling (same batch, varying engine count):
 | 4 | 8,740 | 3.00× |
 | 8 | OOM | — |
 
-4 engines is the sweet spot on Apple Silicon; 8 causes memory contention
-from loading the ~88MB model 8 times.
+The default is 1 engine per worker. Additional engines only help when a
+single `translate_batch` call contains many texts — the batch items are
+distributed round-robin across engines. For single-item batches (long-form
+text translation), only one engine does work regardless of count.
+
+4 engines gives ~3× throughput over 1 engine for batch-short-text workloads
+on Apple Silicon. 8 engines causes OOM from loading the ~88MB model 8×.
+
+**Long-text throughput** (zh-Hans → en, ~1310 chars, batch size 1, multi-process):
+
+| Engines/worker | 1 proc | 2 proc | 4 proc | 8 proc | 16 proc |
+|---|---|---|---|---|---|
+| 1 | 1,593 | 3,256 | 5,299 | 7,856 | 8,926 |
+| 2 | 1,740 | 3,177 | 5,357 | 7,417 | 8,894 |
+| 3 | 1,666 | 3,210 | 5,566 | 8,209 | 8,754 |
+| 4 | 1,690 | 3,218 | 5,338 | 7,236 | 8,949 |
+
+Engine count has no measurable effect on single-item throughput — only
+process count matters. The default of 1 engine minimizes memory with no
+throughput regression.
+
+With multiple language pairs, each pair gets its own worker subprocess.
+Reduce the per-worker count to keep total engines within budget:
+
+```rust
+apple_translate_rs_sync::set_worker_num_engines(2);  // bump up for batch workloads
+```
+
+Also settable via `APPLE_TRANSLATE_RS_SYNC_WORKER_NUM_ENGINES`.
 
 For short sentence-length texts (~15-25 chars), the batch API
 (`translations(from:)`) gives ~12× improvement over sequential
@@ -348,6 +379,11 @@ The `translation-worker` binary (`src/translation-worker.m`) hosts
 `EMTTranslator` engines in a standalone ObjC process, isolating C++
 exceptions from the Rust FFI boundary. `src/worker_pool.rs` manages
 the subprocess lifecycle and caches workers per language pair.
+
+Each worker runs `worker_num_engines()` engines (default 1, overridable
+via `set_worker_num_engines()` or the `APPLE_TRANSLATE_RS_SYNC_WORKER_NUM_ENGINES`
+env var). The worker drains its autorelease pool after each batch to
+avoid unbounded memory growth.
 
 The worker uses a count-based stdin/stdout protocol:
 ```

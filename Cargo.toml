@@ -1,6 +1,6 @@
 [package]
 name = "apple-translate-rs-sync"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "Synchronous Rust bindings for Apple's on-device Translation framework"
 repository = "https://github.com/joshuarli/apple-translate-rs-sync"

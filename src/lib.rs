@@ -2,6 +2,8 @@ mod config;
 mod ffi;
 mod worker_pool;
 
+pub use config::{DEFAULT_WORKER_NUM_ENGINES, set_worker_num_engines, worker_num_engines};
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -371,8 +373,8 @@ impl LanguageTranslator {
 
         let texts: Vec<String> = requests.iter().map(|r| r.source_text.clone()).collect();
 
-        if let Some(pool) = worker_pool_for(&self.source, &self.target) {
-            if let Ok(mut guard) = pool.lock() {
+        if let Some(pool) = worker_pool_for(&self.source, &self.target)
+            && let Ok(mut guard) = pool.lock() {
                 match guard.translate_batch(&texts) {
                     Ok(worker_results) if is_usable_batch(&worker_results) => {
                         return self.responses_from_targets(requests, worker_results);
@@ -401,7 +403,6 @@ impl LanguageTranslator {
                     }
                 }
             }
-        }
 
         let results: Vec<String> =
             ffi::ffi::mt_translate_batch(self.source.clone(), self.target.clone(), texts);

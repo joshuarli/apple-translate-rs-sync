@@ -44,6 +44,22 @@ falls back to the public `TranslationSession` batch API.
 Set `APPLE_TRANSLATE_RS_SYNC_WORKER_BIN=/path/to/translation-worker` to override
 the embedded helper for debugging.
 
+### Engine count
+
+Each worker subprocess runs one `EMTTranslator` engine by default (~88 MB RSS).
+For batch translations of many short texts, increase the engine count to get
+intra-worker parallelism (texts within a batch are distributed across engines):
+
+```rust
+apple_translate_rs_sync::set_worker_num_engines(4);
+```
+
+Or via environment variable: `APPLE_TRANSLATE_RS_SYNC_WORKER_NUM_ENGINES=4`
+
+Values are clamped to 1–32. More engines only help when a single
+`translate_batch` call contains many items; for single-text batches
+(e.g. long-form translation) additional engines sit idle.
+
 ## Notes
 
 This crate links Swift and Objective-C code in `build.rs` and is intended for
