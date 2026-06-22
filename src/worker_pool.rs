@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::config::{self, WORKER_NUM_ENGINES};
@@ -74,14 +74,19 @@ impl WorkerPool {
             return Vec::new();
         }
 
-        // Write count, then texts.
+        // Write count, then length-prefixed UTF-8 texts.
         if let Err(e) = writeln!(self.stdin, "{}", texts.len()) {
             eprintln!("apple-translate-rs-sync: write count failed: {e}");
             return texts.iter().map(|_| String::new()).collect();
         }
         for text in texts {
-            if let Err(e) = writeln!(self.stdin, "{text}") {
-                eprintln!("apple-translate-rs-sync: write text failed: {e}");
+            let bytes = text.as_bytes();
+            if let Err(e) = writeln!(self.stdin, "{}", bytes.len()) {
+                eprintln!("apple-translate-rs-sync: write text length failed: {e}");
+                return texts.iter().map(|_| String::new()).collect();
+            }
+            if let Err(e) = self.stdin.write_all(bytes) {
+                eprintln!("apple-translate-rs-sync: write text bytes failed: {e}");
                 return texts.iter().map(|_| String::new()).collect();
             }
         }
@@ -90,7 +95,7 @@ impl WorkerPool {
             return texts.iter().map(|_| String::new()).collect();
         }
 
-        // Read results.
+        // Read length-prefixed UTF-8 results.
         let mut results = Vec::with_capacity(texts.len());
         let mut line = String::new();
 
@@ -99,13 +104,19 @@ impl WorkerPool {
             match self.stdout.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if line.ends_with('\n') {
-                        line.pop();
-                        if line.ends_with('\r') {
-                            line.pop();
+                    let len = match line.trim_end().parse::<usize>() {
+                        Ok(len) => len,
+                        Err(e) => {
+                            eprintln!("apple-translate-rs-sync: invalid result length: {e}");
+                            break;
                         }
+                    };
+                    let mut bytes = vec![0; len];
+                    if let Err(e) = self.stdout.read_exact(&mut bytes) {
+                        eprintln!("apple-translate-rs-sync: read result bytes failed: {e}");
+                        break;
                     }
-                    results.push(std::mem::take(&mut line));
+                    results.push(String::from_utf8(bytes).unwrap_or_default());
                 }
                 Err(e) => {
                     eprintln!("apple-translate-rs-sync: read failed: {e}");

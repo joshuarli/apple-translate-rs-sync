@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+const EMBEDDED_WORKER: &[u8] = include_bytes!(env!("APPLE_TRANSLATE_RS_SYNC_WORKER_BIN"));
+const EMBEDDED_WORKER_ID: &str = env!("APPLE_TRANSLATE_RS_SYNC_WORKER_ID");
+
 /// Number of EMTTranslator engines per worker subprocess.
 /// 4 is the sweet spot on Apple Silicon: 3.0× scaling over single engine.
 /// More engines cause memory contention (each loads the ~88 MB model).
@@ -56,6 +59,13 @@ pub fn normalize_locale(tag: &str) -> String {
 
 /// Find the translation worker binary.
 pub fn find_worker_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("APPLE_TRANSLATE_RS_SYNC_WORKER_BIN") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -68,7 +78,34 @@ pub fn find_worker_bin() -> Option<PathBuf> {
     if generated.exists() {
         return Some(generated);
     }
-    None
+    materialize_embedded_worker()
+}
+
+fn materialize_embedded_worker() -> Option<PathBuf> {
+    let dir = std::env::temp_dir()
+        .join("apple-translate-rs-sync")
+        .join(EMBEDDED_WORKER_ID);
+    let path = dir.join("translation-worker");
+
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() == EMBEDDED_WORKER.len() as u64
+    {
+        return Some(path);
+    }
+
+    std::fs::create_dir_all(&dir).ok()?;
+    let tmp = dir.join(format!("translation-worker.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, EMBEDDED_WORKER).ok()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).ok()?;
+    }
+
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
 }
 
 /// Find the AssetsV3 directory for a language pair.

@@ -2,6 +2,22 @@
 name = "apple-translate-rs-sync"
 version = "0.0.1"
 edition = "2024"
+description = "Synchronous Rust bindings for Apple's on-device Translation framework"
+repository = "https://github.com/joshuarli/apple-translate-rs-sync"
+readme = "README.md"
+license = "MIT"
+keywords = ["apple", "translation", "macos", "swift"]
+categories = ["api-bindings", "os::macos-apis"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "rust-toolchain.toml",
+    "src/**/*.rs",
+    "src/**/*.swift",
+    "src/**/*.m",
+    "tests/**/*.rs",
+]
 
 [[bin]]
 name = "translate-cli"

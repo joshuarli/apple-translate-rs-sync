@@ -1,9 +1,10 @@
 use std::env;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let out_dir = PathBuf::from("./generated");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
     let bridges = vec!["src/ffi.rs"];
 
     for path in &bridges {
@@ -100,8 +101,18 @@ fn main() {
         );
     }
 
+    let worker_bytes = std::fs::read(&worker_path).expect("failed to read translation-worker");
+    let mut hasher = DefaultHasher::new();
+    worker_bytes.hash(&mut hasher);
+    let worker_id = format!("{:016x}", hasher.finish());
+
     // Step 5: Link into Rust build.
     println!("cargo:rustc-link-lib=static={}", lib_name);
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+    println!(
+        "cargo:rustc-env=APPLE_TRANSLATE_RS_SYNC_WORKER_BIN={}",
+        worker_path.display()
+    );
+    println!("cargo:rustc-env=APPLE_TRANSLATE_RS_SYNC_WORKER_ID={worker_id}");
 }

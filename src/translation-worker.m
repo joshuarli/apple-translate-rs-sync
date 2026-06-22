@@ -4,10 +4,12 @@
 //
 // Protocol (stdin):
 //   <count>\n        — number of texts in this batch (0 = exit)
-//   <text>\n         — one source text per line, repeated <count> times
+//   <byte-len>\n     — UTF-8 byte length for the next source text
+//   <bytes>          — source text bytes, repeated <count> times
 //
 // Protocol (stdout):
-//   <translated>\n   — one translated text per line, same order as inputs
+//   <byte-len>\n     — UTF-8 byte length for the next translated text
+//   <bytes>          — translated text bytes, same order as inputs
 //
 // Usage: translation-worker <assets-dir> <num-engines> <src-lang> <tgt-lang>
 
@@ -131,6 +133,33 @@ static NSString* engineTranslate(id engine, const char *srcLang, const char *tgt
     }
 }
 
+static NSString* readPayload(FILE *stream, char **line, size_t *linecap) {
+    ssize_t len = getline(line, linecap, stream);
+    if (len <= 0) return nil;
+
+    long byteLen = strtol(*line, NULL, 10);
+    if (byteLen < 0 || byteLen > 100000000) return nil;
+
+    NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)byteLen];
+    if (byteLen > 0) {
+        size_t readLen = fread(data.mutableBytes, 1, (size_t)byteLen, stream);
+        if (readLen != (size_t)byteLen) return nil;
+    }
+
+    NSString *payload = [[NSString alloc] initWithBytes:data.bytes
+                                                 length:data.length
+                                               encoding:NSUTF8StringEncoding];
+    return payload ?: @"";
+}
+
+static void writePayload(FILE *stream, NSString *payload) {
+    NSData *data = [payload dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    fprintf(stream, "%lu\n", (unsigned long)data.length);
+    if (data.length > 0) {
+        fwrite(data.bytes, 1, data.length, stream);
+    }
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc != 5) {
@@ -175,14 +204,12 @@ int main(int argc, const char **argv) {
             if (count == 0) break;
             if (count < 0 || count > 1000000) break;
 
-            // Read texts.
+            // Read length-prefixed UTF-8 texts.
             NSMutableArray *inputs = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
             for (long i = 0; i < count; i++) {
-                len = getline(&line, &linecap, stdin);
-                if (len <= 0) break;
-                // Trim trailing newline.
-                if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
-                [inputs addObject:@(line)];
+                NSString *input = readPayload(stdin, &line, &linecap);
+                if (!input) break;
+                [inputs addObject:input];
             }
 
             NSUInteger n = inputs.count;
@@ -229,9 +256,9 @@ int main(int argc, const char **argv) {
             for (NSUInteger i = 0; i < n; i++) {
                 NSString *r = results[i];
                 if ((id)r == [NSNull null]) {
-                    printf("\n");
+                    writePayload(stdout, @"");
                 } else {
-                    printf("%s\n", [r UTF8String]);
+                    writePayload(stdout, r);
                 }
             }
             fflush(stdout);
