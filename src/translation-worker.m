@@ -167,7 +167,10 @@ static NSString* engineTranslate(id engine, const char *srcLang, const char *tgt
         [inv setArgument:&srcLocale atIndex:3];
         [inv setArgument:&tgtLocale atIndex:4];
         [inv setArgument:&completion atIndex:5];
-        [inv retainArguments];
+        // No retainArguments — input, srcLocale, tgtLocale, and the completion
+        // block are all alive on the stack for the entire duration of this
+        // function (through invoke + the semaphore wait below).  The framework
+        // copies the completion block internally.
         [inv invoke];
 
         if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
@@ -267,68 +270,74 @@ int main(int argc, const char **argv) {
 
         // Main loop: read count, then that many texts.
         while (1) {
-            // Read count.
-            ssize_t len = getline(&line, &linecap, stdin);
-            if (len <= 0) break;
-            long count = 0;
-            if (!parseLongLine(line, 0, 1000000, &count)) break;
-            if (count == 0) break;
+            // Each iteration is a batch. Autorelease pool here so that
+            // autoreleased objects from Foundation convenience constructors
+            // (NSMutableArray, NSMutableData, NSData, etc.) are drained after
+            // every batch instead of accumulating until process exit.
+            @autoreleasepool {
+                // Read count.
+                ssize_t len = getline(&line, &linecap, stdin);
+                if (len <= 0) break;
+                long count = 0;
+                if (!parseLongLine(line, 0, 1000000, &count)) break;
+                if (count == 0) break;
 
-            // Read length-prefixed UTF-8 texts.
-            NSMutableArray *inputs = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
-            for (long i = 0; i < count; i++) {
-                NSString *input = readPayload(stdin, &line, &linecap);
-                if (!input) break;
-                [inputs addObject:input];
-            }
-
-            NSUInteger n = inputs.count;
-            if (n != (NSUInteger)count) {
-                break;
-            }
-
-            // Pre-allocate results with NSNull sentinels.
-            NSMutableArray *results = [NSMutableArray arrayWithCapacity:n];
-            for (NSUInteger i = 0; i < n; i++) {
-                [results addObject:[NSNull null]];
-            }
-
-            dispatch_group_t group = dispatch_group_create();
-            __block int nextEngine = 0;
-            NSLock *lock = [[NSLock alloc] init];
-
-            for (NSUInteger i = 0; i < n; i++) {
-                NSString *text = inputs[i];
-                if (text.length == 0) {
-                    results[i] = @"";
-                    continue;
+                // Read length-prefixed UTF-8 texts.
+                NSMutableArray *inputs = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+                for (long i = 0; i < count; i++) {
+                    NSString *input = readPayload(stdin, &line, &linecap);
+                    if (!input) break;
+                    [inputs addObject:input];
                 }
 
-                [lock lock];
-                id engine = engines[nextEngine % engines.count];
-                nextEngine++;
-                [lock unlock];
+                NSUInteger n = inputs.count;
+                if (n != (NSUInteger)count) {
+                    break;
+                }
 
-                dispatch_group_async(group, concurrentQueue, ^{
-                    NSString *translated = engineTranslate(engine, srcLang, tgtLang, text);
-                    @synchronized (results) {
-                        results[i] = translated ?: @"";
+                // Pre-allocate results with NSNull sentinels.
+                NSMutableArray *results = [NSMutableArray arrayWithCapacity:n];
+                for (NSUInteger i = 0; i < n; i++) {
+                    [results addObject:[NSNull null]];
+                }
+
+                dispatch_group_t group = dispatch_group_create();
+                __block int nextEngine = 0;
+                NSLock *lock = [[NSLock alloc] init];
+
+                for (NSUInteger i = 0; i < n; i++) {
+                    NSString *text = inputs[i];
+                    if (text.length == 0) {
+                        results[i] = @"";
+                        continue;
                     }
-                });
-            }
 
-            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+                    [lock lock];
+                    id engine = engines[nextEngine % engines.count];
+                    nextEngine++;
+                    [lock unlock];
 
-            // Output results in order.
-            for (NSUInteger i = 0; i < n; i++) {
-                NSString *r = results[i];
-                if ((id)r == [NSNull null]) {
-                    writePayload(protocolOut, @"");
-                } else {
-                    writePayload(protocolOut, r);
+                    dispatch_group_async(group, concurrentQueue, ^{
+                        NSString *translated = engineTranslate(engine, srcLang, tgtLang, text);
+                        @synchronized (results) {
+                            results[i] = translated ?: @"";
+                        }
+                    });
                 }
+
+                dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+                // Output results in order.
+                for (NSUInteger i = 0; i < n; i++) {
+                    NSString *r = results[i];
+                    if ((id)r == [NSNull null]) {
+                        writePayload(protocolOut, @"");
+                    } else {
+                        writePayload(protocolOut, r);
+                    }
+                }
+                fflush(protocolOut);
             }
-            fflush(protocolOut);
         }
 
         free(line);
