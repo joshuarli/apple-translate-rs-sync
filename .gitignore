@@ -1,0 +1,17 @@
+# Rust build output
+target/
+
+# swift-bridge generated FFI glue
+generated/
+
+# Library crates should not commit lockfiles
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
