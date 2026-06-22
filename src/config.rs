@@ -66,6 +66,10 @@ pub fn find_worker_bin() -> Option<PathBuf> {
         }
     }
 
+    if let Some(path) = materialize_embedded_worker() {
+        return Some(path);
+    }
+
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -78,7 +82,7 @@ pub fn find_worker_bin() -> Option<PathBuf> {
     if generated.exists() {
         return Some(generated);
     }
-    materialize_embedded_worker()
+    None
 }
 
 fn materialize_embedded_worker() -> Option<PathBuf> {

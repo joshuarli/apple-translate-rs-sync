@@ -2,7 +2,7 @@ mod config;
 mod ffi;
 mod worker_pool;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -130,9 +130,19 @@ type SharedWorkerPool = Arc<Mutex<worker_pool::WorkerPool>>;
 
 static WORKER_POOL_CACHE: LazyLock<Mutex<HashMap<String, SharedWorkerPool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISABLED_WORKER_PAIRS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn pair_key(source: &str, target: &str) -> String {
+    format!("{source}->{target}")
+}
 
 fn worker_pool_for(source: &str, target: &str) -> Option<SharedWorkerPool> {
-    let pair_key = format!("{source}->{target}");
+    let pair_key = pair_key(source, target);
+    if DISABLED_WORKER_PAIRS.lock().ok()?.contains(&pair_key) {
+        return None;
+    }
+
     let mut cache = WORKER_POOL_CACHE.lock().ok()?;
     if let Some(pool) = cache.get(&pair_key) {
         return Some(Arc::clone(pool));
@@ -143,6 +153,24 @@ fn worker_pool_for(source: &str, target: &str) -> Option<SharedWorkerPool> {
     )?));
     cache.insert(pair_key, Arc::clone(&pool));
     Some(pool)
+}
+
+fn discard_worker_pool(source: &str, target: &str, pool: &SharedWorkerPool) {
+    let pair_key = pair_key(source, target);
+    if let Ok(mut cache) = WORKER_POOL_CACHE.lock()
+        && cache
+            .get(&pair_key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, pool))
+    {
+        cache.remove(&pair_key);
+    }
+}
+
+fn disable_worker_pair(source: &str, target: &str) {
+    let pair_key = pair_key(source, target);
+    if let Ok(mut disabled) = DISABLED_WORKER_PAIRS.lock() {
+        disabled.insert(pair_key);
+    }
 }
 
 /// A single translation request.
@@ -343,12 +371,35 @@ impl LanguageTranslator {
 
         let texts: Vec<String> = requests.iter().map(|r| r.source_text.clone()).collect();
 
-        if let Some(pool) = worker_pool_for(&self.source, &self.target)
-            && let Ok(mut pool) = pool.lock()
-        {
-            let worker_results = pool.translate_batch(&texts);
-            if is_usable_batch(&worker_results) {
-                return self.responses_from_targets(requests, worker_results);
+        if let Some(pool) = worker_pool_for(&self.source, &self.target) {
+            if let Ok(mut guard) = pool.lock() {
+                match guard.translate_batch(&texts) {
+                    Ok(worker_results) if is_usable_batch(&worker_results) => {
+                        return self.responses_from_targets(requests, worker_results);
+                    }
+                    Ok(_) => {
+                        if texts.iter().any(|text| !text.is_empty()) {
+                            eprintln!(
+                                "apple-translate-rs-sync: worker returned no usable translations; disabling worker for {}->{} and falling back",
+                                self.source, self.target
+                            );
+                            guard.terminate();
+                            drop(guard);
+                            discard_worker_pool(&self.source, &self.target, &pool);
+                            disable_worker_pair(&self.source, &self.target);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "apple-translate-rs-sync: worker failed: {err}; disabling worker for {}->{} and falling back",
+                            self.source, self.target
+                        );
+                        guard.terminate();
+                        drop(guard);
+                        discard_worker_pool(&self.source, &self.target, &pool);
+                        disable_worker_pair(&self.source, &self.target);
+                    }
+                }
             }
         }
 

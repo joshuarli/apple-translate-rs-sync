@@ -2,6 +2,18 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <string.h>
+
+static const char* safeUTF8(NSString *value) {
+    const char *text = [value UTF8String];
+    return text ?: "(unavailable)";
+}
+
+static NSString* fileSystemString(const char *path) {
+    if (!path) return nil;
+    return [[NSFileManager defaultManager] stringWithFileSystemRepresentation:path
+                                                                       length:strlen(path)];
+}
 
 static bool frameworksLoaded = false;
 
@@ -15,7 +27,10 @@ id createEngine(const char *assetsDir) {
     Class EMTCls = NSClassFromString(@"EMTTranslator");
     if (!EMTCls) return NULL;
 
-    NSURL *url = [NSURL fileURLWithPath:@(assetsDir)];
+    NSString *path = fileSystemString(assetsDir);
+    if (!path) return NULL;
+
+    NSURL *url = [NSURL fileURLWithPath:path];
     SEL initSel = NSSelectorFromString(@"initWithModelURL:task:skipNonFinalToCatchup:translatorCacheSize:useGlobalTranslationQueue:");
 
     id engine = [EMTCls alloc];
@@ -54,7 +69,7 @@ id createEngine(const char *assetsDir) {
         return result;
     } @catch (NSException *e) {
         fprintf(stderr, "apple-translate-rs-sync: createEngine exception: %s\n",
-                [e.reason UTF8String]);
+                safeUTF8(e.reason));
         return NULL;
     }
 }
@@ -67,14 +82,21 @@ NSString* engineTranslate(id engine, const char *srcLang, const char *tgtLang, c
 
         NSLocale *srcLocale = [[NSLocale alloc] initWithLocaleIdentifier:@(srcLang)];
         NSLocale *tgtLocale = [[NSLocale alloc] initWithLocaleIdentifier:@(tgtLang)];
-        NSString *input = @(text);
+        NSString *input = text ? [NSString stringWithUTF8String:text] : nil;
+        if (!input) return NULL;
 
         __block NSString *result = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
         void (^completion)(id, NSError*) = ^(id res, NSError *err) {
-            if ([res isKindOfClass:[NSArray class]] && [(NSArray*)res count] > 0) {
-                result = [(NSArray*)res firstObject];
+            @try {
+                if ([res isKindOfClass:[NSArray class]] && [(NSArray*)res count] > 0) {
+                    id first = [(NSArray*)res firstObject];
+                    result = [first isKindOfClass:[NSString class]] ? first : [first description];
+                }
+            } @catch (NSException *e) {
+                fprintf(stderr, "apple-translate-rs-sync: engineTranslate completion exception: %s\n",
+                        safeUTF8(e.reason));
             }
             dispatch_semaphore_signal(sem);
         };
@@ -89,11 +111,13 @@ NSString* engineTranslate(id engine, const char *srcLang, const char *tgtLang, c
         [inv retainArguments];
         [inv invoke];
 
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
+            return NULL;
+        }
         return result;
     } @catch (NSException *e) {
         fprintf(stderr, "apple-translate-rs-sync: engineTranslate ObjC exception: %s\n",
-                [e.reason UTF8String]);
+                safeUTF8(e.reason));
         return NULL;
     }
 }

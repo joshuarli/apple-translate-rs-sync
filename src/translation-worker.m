@@ -17,6 +17,40 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <errno.h>
+#import <string.h>
+#import <unistd.h>
+
+static const char* safeUTF8(NSString *value) {
+    const char *text = [value UTF8String];
+    return text ?: "(unavailable)";
+}
+
+static NSString* fileSystemString(const char *path) {
+    if (!path) return nil;
+    return [[NSFileManager defaultManager] stringWithFileSystemRepresentation:path
+                                                                       length:strlen(path)];
+}
+
+static bool parseLongLine(const char *line, long min, long max, long *out) {
+    if (!line || !out) return false;
+
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(line, &end, 10);
+    if (errno != 0 || end == line || value < min || value > max) {
+        return false;
+    }
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+
+    *out = value;
+    return true;
+}
 
 static id createEngine(const char *assetsDir) {
     static dispatch_once_t once;
@@ -28,7 +62,10 @@ static id createEngine(const char *assetsDir) {
     Class EMTCls = NSClassFromString(@"EMTTranslator");
     if (!EMTCls) return NULL;
 
-    NSURL *url = [NSURL fileURLWithPath:@(assetsDir)];
+    NSString *path = fileSystemString(assetsDir);
+    if (!path) return NULL;
+
+    NSURL *url = [NSURL fileURLWithPath:path];
     SEL initSel = NSSelectorFromString(@"initWithModelURL:task:skipNonFinalToCatchup:translatorCacheSize:useGlobalTranslationQueue:");
 
     id engine = [EMTCls alloc];
@@ -65,37 +102,42 @@ static id createEngine(const char *assetsDir) {
         }
         return result;
     } @catch (NSException *e) {
-        fprintf(stderr, "translation-worker: createEngine: %s\n", [e.reason UTF8String]);
+        fprintf(stderr, "translation-worker: createEngine: %s\n", safeUTF8(e.reason));
         return NULL;
     }
 }
 
 static NSString* extractText(id first) {
-    if ([first isKindOfClass:[NSString class]]) {
-        return first;
-    }
-    // EMTResult — join token texts respecting spacing.
-    NSArray *tokens = [first valueForKey:@"tokens"];
-    if (![tokens isKindOfClass:[NSArray class]]) {
-        return [first description];
-    }
-    NSMutableString *joined = [NSMutableString string];
-    for (id token in tokens) {
-        NSString *text = [token valueForKey:@"text"];
-        if (!text) continue;
-        if (joined.length > 0) {
-            // Check if precededBySpace on this token.
-            NSNumber *preceded = [token valueForKey:@"precededBySpace"];
-            if (preceded && [preceded boolValue]) {
-                [joined appendString:@" "];
-            }
+    @try {
+        if ([first isKindOfClass:[NSString class]]) {
+            return first;
         }
-        [joined appendString:text];
+        // EMTResult — join token texts respecting spacing.
+        NSArray *tokens = [first valueForKey:@"tokens"];
+        if (![tokens isKindOfClass:[NSArray class]]) {
+            return [first description] ?: @"";
+        }
+        NSMutableString *joined = [NSMutableString string];
+        for (id token in tokens) {
+            NSString *text = [token valueForKey:@"text"];
+            if (![text isKindOfClass:[NSString class]]) continue;
+            if (joined.length > 0) {
+                // Check if precededBySpace on this token.
+                NSNumber *preceded = [token valueForKey:@"precededBySpace"];
+                if ([preceded respondsToSelector:@selector(boolValue)] && [preceded boolValue]) {
+                    [joined appendString:@" "];
+                }
+            }
+            [joined appendString:text];
+        }
+        return joined;
+    } @catch (NSException *e) {
+        fprintf(stderr, "translation-worker: extractText: %s\n", safeUTF8(e.reason));
+        return @"";
     }
-    return joined;
 }
 
-static NSString* engineTranslate(id engine, const char *srcLang, const char *tgtLang, const char *text) {
+static NSString* engineTranslate(id engine, const char *srcLang, const char *tgtLang, NSString *input) {
     @try {
         SEL transSel = NSSelectorFromString(@"translateString:from:to:completion:");
         NSMethodSignature *sig = [engine methodSignatureForSelector:transSel];
@@ -103,14 +145,17 @@ static NSString* engineTranslate(id engine, const char *srcLang, const char *tgt
 
         NSLocale *srcLocale = [[NSLocale alloc] initWithLocaleIdentifier:@(srcLang)];
         NSLocale *tgtLocale = [[NSLocale alloc] initWithLocaleIdentifier:@(tgtLang)];
-        NSString *input = @(text);
 
         __block NSString *result = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
         void (^completion)(id, NSError*) = ^(id res, NSError *err) {
-            if ([res isKindOfClass:[NSArray class]] && [(NSArray*)res count] > 0) {
-                result = extractText([(NSArray*)res firstObject]);
+            @try {
+                if ([res isKindOfClass:[NSArray class]] && [(NSArray*)res count] > 0) {
+                    result = extractText([(NSArray*)res firstObject]);
+                }
+            } @catch (NSException *e) {
+                fprintf(stderr, "translation-worker: completion: %s\n", safeUTF8(e.reason));
             }
             dispatch_semaphore_signal(sem);
         };
@@ -125,10 +170,12 @@ static NSString* engineTranslate(id engine, const char *srcLang, const char *tgt
         [inv retainArguments];
         [inv invoke];
 
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
+            return NULL;
+        }
         return result ?: @"";
     } @catch (NSException *e) {
-        fprintf(stderr, "translation-worker: engineTranslate: %s\n", [e.reason UTF8String]);
+        fprintf(stderr, "translation-worker: engineTranslate: %s\n", safeUTF8(e.reason));
         return NULL;
     }
 }
@@ -137,10 +184,11 @@ static NSString* readPayload(FILE *stream, char **line, size_t *linecap) {
     ssize_t len = getline(line, linecap, stream);
     if (len <= 0) return nil;
 
-    long byteLen = strtol(*line, NULL, 10);
-    if (byteLen < 0 || byteLen > 100000000) return nil;
+    long byteLen = 0;
+    if (!parseLongLine(*line, 0, 100000000, &byteLen)) return nil;
 
     NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)byteLen];
+    if (!data) return nil;
     if (byteLen > 0) {
         size_t readLen = fread(data.mutableBytes, 1, (size_t)byteLen, stream);
         if (readLen != (size_t)byteLen) return nil;
@@ -149,7 +197,7 @@ static NSString* readPayload(FILE *stream, char **line, size_t *linecap) {
     NSString *payload = [[NSString alloc] initWithBytes:data.bytes
                                                  length:data.length
                                                encoding:NSUTF8StringEncoding];
-    return payload ?: @"";
+    return payload;
 }
 
 static void writePayload(FILE *stream, NSString *payload) {
@@ -165,6 +213,28 @@ int main(int argc, const char **argv) {
         if (argc != 5) {
             fprintf(stderr, "Usage: translation-worker <assets-dir> <num-engines> <src-lang> <tgt-lang>\n");
             return 1;
+        }
+
+        int protocolFd = dup(STDOUT_FILENO);
+        if (protocolFd < 0) {
+            fprintf(stderr, "translation-worker: dup stdout failed\n");
+            return 1;
+        }
+
+        FILE *protocolOut = fdopen(protocolFd, "w");
+        if (!protocolOut) {
+            fprintf(stderr, "translation-worker: fdopen stdout failed\n");
+            close(protocolFd);
+            return 1;
+        }
+        setvbuf(protocolOut, NULL, _IONBF, 0);
+
+        int stderrFd = dup(STDERR_FILENO);
+        if (stderrFd >= 0) {
+            dup2(stderrFd, STDOUT_FILENO);
+            close(stderrFd);
+        } else {
+            freopen("/dev/null", "w", stdout);
         }
 
         const char *assetsDir = argv[1];
@@ -200,9 +270,9 @@ int main(int argc, const char **argv) {
             // Read count.
             ssize_t len = getline(&line, &linecap, stdin);
             if (len <= 0) break;
-            long count = strtol(line, NULL, 10);
+            long count = 0;
+            if (!parseLongLine(line, 0, 1000000, &count)) break;
             if (count == 0) break;
-            if (count < 0 || count > 1000000) break;
 
             // Read length-prefixed UTF-8 texts.
             NSMutableArray *inputs = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
@@ -213,10 +283,8 @@ int main(int argc, const char **argv) {
             }
 
             NSUInteger n = inputs.count;
-            if (n == 0) {
-                printf("0\n");
-                fflush(stdout);
-                continue;
+            if (n != (NSUInteger)count) {
+                break;
             }
 
             // Pre-allocate results with NSNull sentinels.
@@ -242,8 +310,7 @@ int main(int argc, const char **argv) {
                 [lock unlock];
 
                 dispatch_group_async(group, concurrentQueue, ^{
-                    const char *cText = [text UTF8String];
-                    NSString *translated = engineTranslate(engine, srcLang, tgtLang, cText);
+                    NSString *translated = engineTranslate(engine, srcLang, tgtLang, text);
                     @synchronized (results) {
                         results[i] = translated ?: @"";
                     }
@@ -256,15 +323,16 @@ int main(int argc, const char **argv) {
             for (NSUInteger i = 0; i < n; i++) {
                 NSString *r = results[i];
                 if ((id)r == [NSNull null]) {
-                    writePayload(stdout, @"");
+                    writePayload(protocolOut, @"");
                 } else {
-                    writePayload(stdout, r);
+                    writePayload(protocolOut, r);
                 }
             }
-            fflush(stdout);
+            fflush(protocolOut);
         }
 
         free(line);
+        fclose(protocolOut);
         fprintf(stderr, "translation-worker: exiting\n");
     }
     return 0;
