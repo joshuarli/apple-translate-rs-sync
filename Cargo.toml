@@ -7,6 +7,10 @@ edition = "2024"
 name = "translate-cli"
 path = "src/bin/translate-cli.rs"
 
+[[bin]]
+name = "stress"
+path = "src/bin/stress.rs"
+
 [dependencies]
 swift-bridge = "0.1.59"
 

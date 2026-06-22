@@ -1,11 +1,13 @@
+mod config;
 mod ffi;
+mod worker_pool;
 
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use std::cell::RefCell;
-
-// ── Error kind side channel ─────────────────────────────────────────────────
 
 // Thread-local storage for the error kind and message set by Swift via
 // `__mt_set_error`. Read by `take_last_error` after a synchronous FFI
@@ -47,8 +49,6 @@ pub unsafe extern "C" fn __mt_set_error(kind: i32, message_ptr: *const c_char) {
     });
 }
 
-// ── Error kind tags ──────────────────────────────────────────────────────────
-
 // Error kind tags communicated from Swift via `__mt_set_error`. These must
 // match the constants in `TranslationWrapper.swift`.
 #[allow(dead_code)]
@@ -58,8 +58,6 @@ const ERR_LANG_UNSUPPORTED: i32 = 2;
 #[allow(dead_code)]
 const ERR_TRANSLATION_FAILED: i32 = 3;
 const ERR_TIMED_OUT: i32 = 4;
-
-// ── Public types ────────────────────────────────────────────────────────────
 
 /// Errors that can occur during translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +95,55 @@ impl std::fmt::Display for TranslationError {
 }
 
 impl std::error::Error for TranslationError {}
+
+fn timed_out(operation: &'static str, seconds: u64) -> TranslationError {
+    TranslationError::TimedOut { operation, seconds }
+}
+
+fn translation_failed(reason: impl Into<String>) -> TranslationError {
+    TranslationError::TranslationFailed {
+        reason: reason.into(),
+    }
+}
+
+fn source_target_error(
+    kind: i32,
+    source: &str,
+    target: &str,
+    fallback: String,
+) -> TranslationError {
+    match kind {
+        ERR_LANG_NOT_INSTALLED => TranslationError::LanguageNotInstalled {
+            source: source.to_owned(),
+            target: target.to_owned(),
+        },
+        ERR_LANG_UNSUPPORTED => TranslationError::LanguageUnsupported {
+            source: source.to_owned(),
+            target: target.to_owned(),
+        },
+        ERR_TIMED_OUT => timed_out("check_language_availability", 15),
+        _ => translation_failed(fallback),
+    }
+}
+
+type SharedWorkerPool = Arc<Mutex<worker_pool::WorkerPool>>;
+
+static WORKER_POOL_CACHE: LazyLock<Mutex<HashMap<String, SharedWorkerPool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn worker_pool_for(source: &str, target: &str) -> Option<SharedWorkerPool> {
+    let pair_key = format!("{source}->{target}");
+    let mut cache = WORKER_POOL_CACHE.lock().ok()?;
+    if let Some(pool) = cache.get(&pair_key) {
+        return Some(Arc::clone(pool));
+    }
+
+    let pool = Arc::new(Mutex::new(worker_pool::WorkerPool::try_create(
+        source, target,
+    )?));
+    cache.insert(pair_key, Arc::clone(&pool));
+    Some(pool)
+}
 
 /// A single translation request.
 ///
@@ -185,8 +232,6 @@ pub struct LanguageTranslator {
     target: String,
 }
 
-// ── Language detection ──────────────────────────────────────────────────────
-
 /// Detect the dominant language of the given text.
 ///
 /// Uses Apple's `NaturalLanguage` framework (`NLLanguageRecognizer`).
@@ -198,8 +243,6 @@ pub struct LanguageTranslator {
 pub fn detect_language(text: &str) -> Option<String> {
     ffi::ffi::mt_detect_language(text.to_owned())
 }
-
-// ── Language availability ───────────────────────────────────────────────────
 
 /// Check whether the given language pair is available for on-device translation.
 ///
@@ -213,26 +256,10 @@ pub fn detect_language(text: &str) -> Option<String> {
 pub fn check_language_availability(source: &str, target: &str) -> Result<(), TranslationError> {
     if let Some(msg) = ffi::ffi::mt_check_languages(source.to_owned(), target.to_owned()) {
         let (kind, _detail) = take_last_error();
-        return Err(match kind {
-            ERR_LANG_NOT_INSTALLED => TranslationError::LanguageNotInstalled {
-                source: source.to_owned(),
-                target: target.to_owned(),
-            },
-            ERR_LANG_UNSUPPORTED => TranslationError::LanguageUnsupported {
-                source: source.to_owned(),
-                target: target.to_owned(),
-            },
-            ERR_TIMED_OUT => TranslationError::TimedOut {
-                operation: "check_language_availability",
-                seconds: 15,
-            },
-            _ => TranslationError::TranslationFailed { reason: msg },
-        });
+        return Err(source_target_error(kind, source, target, msg));
     }
     Ok(())
 }
-
-// ── LanguageTranslator implementation ───────────────────────────────────────
 
 impl LanguageTranslator {
     /// Create a new translator for the given language pair.
@@ -265,8 +292,6 @@ impl LanguageTranslator {
         &self.target
     }
 
-    // ── translate (single, sync) ────────────────────────────────────────
-
     /// Translate a single string.
     ///
     /// Mirrors `TranslationSession.translate(_:)`.
@@ -282,15 +307,11 @@ impl LanguageTranslator {
                 .ok_or_else(|| {
                     let (kind, _detail) = take_last_error();
                     match kind {
-                ERR_TIMED_OUT => TranslationError::TimedOut {
-                    operation: "translate",
-                    seconds: 30,
-                },
-                _ => TranslationError::TranslationFailed {
-                    reason: "translation failed (check stderr for details from the Swift runtime)"
-                        .into(),
-                },
-            }
+                        ERR_TIMED_OUT => timed_out("translate", 30),
+                        _ => translation_failed(
+                            "translation failed (check stderr for details from the Swift runtime)",
+                        ),
+                    }
                 })?;
 
         Ok(TranslationResponse {
@@ -301,8 +322,6 @@ impl LanguageTranslator {
             client_identifier: None,
         })
     }
-
-    // ── translate_batch (sync) ──────────────────────────────────────────
 
     /// Translate a batch of requests.
     ///
@@ -323,31 +342,42 @@ impl LanguageTranslator {
         }
 
         let texts: Vec<String> = requests.iter().map(|r| r.source_text.clone()).collect();
+
+        if let Some(pool) = worker_pool_for(&self.source, &self.target)
+            && let Ok(mut pool) = pool.lock()
+        {
+            let worker_results = pool.translate_batch(&texts);
+            if is_usable_batch(&worker_results) {
+                return self.responses_from_targets(requests, worker_results);
+            }
+        }
+
         let results: Vec<String> =
             ffi::ffi::mt_translate_batch(self.source.clone(), self.target.clone(), texts);
 
         if results.is_empty() {
             let (kind, _detail) = take_last_error();
             let err = match kind {
-                ERR_TIMED_OUT => TranslationError::TimedOut {
-                    operation: "translate_batch",
-                    seconds: 60,
-                },
-                _ => TranslationError::TranslationFailed {
-                    reason: "batch translation failed".into(),
-                },
+                ERR_TIMED_OUT => timed_out("translate_batch", 60),
+                _ => translation_failed("batch translation failed"),
             };
             return requests.iter().map(|_| Err(err.clone())).collect();
         }
 
+        self.responses_from_targets(requests, results)
+    }
+
+    fn responses_from_targets(
+        &self,
+        requests: &[TranslationRequest],
+        targets: Vec<String>,
+    ) -> Vec<Result<TranslationResponse, TranslationError>> {
         requests
             .iter()
-            .zip(results)
+            .zip(targets)
             .map(|(req, target_text)| {
                 if target_text.is_empty() {
-                    Err(TranslationError::TranslationFailed {
-                        reason: "translation failed".into(),
-                    })
+                    Err(translation_failed("translation failed"))
                 } else {
                     Ok(TranslationResponse {
                         source_language: self.source.clone(),
@@ -360,8 +390,6 @@ impl LanguageTranslator {
             })
             .collect()
     }
-
-    // ── prepare ─────────────────────────────────────────────────────────
 
     /// Pre-warm the translation engine.
     ///
@@ -378,15 +406,16 @@ impl LanguageTranslator {
         {
             let (kind, _detail) = take_last_error();
             return Err(match kind {
-                ERR_TIMED_OUT => TranslationError::TimedOut {
-                    operation: "prepare",
-                    seconds: 60,
-                },
-                _ => TranslationError::TranslationFailed { reason: msg },
+                ERR_TIMED_OUT => timed_out("prepare", 60),
+                _ => translation_failed(msg),
             });
         }
         Ok(())
     }
+}
+
+fn is_usable_batch(results: &[String]) -> bool {
+    !results.is_empty() && results.iter().any(|r| !r.is_empty())
 }
 
 #[cfg(test)]
